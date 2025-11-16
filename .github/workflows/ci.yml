@@ -1,0 +1,200 @@
+name: Genesis SDK CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  lint:
+    name: Code Linting
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install clang-format
+      run: sudo apt-get install -y clang-format
+    
+    - name: Run clang-format
+      run: |
+        find Core Platform -name '*.cpp' -o -name '*.hpp' | xargs clang-format --dry-run --Werror
+
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build libbluetooth-dev \
+          libgtest-dev g++ clang
+    
+    - name: Configure CMake
+      env:
+        CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+        CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+          -DBUILD_TESTING=ON \
+          -DENABLE_COVERAGE=ON
+    
+    - name: Build
+      run: cmake --build build --parallel
+    
+    - name: Run Tests
+      run: cd build && ctest --output-on-failure --verbose
+    
+    - name: Generate Coverage
+      if: matrix.compiler == 'gcc'
+      run: |
+        sudo apt-get install -y lcov
+        lcov --directory build --capture --output-file coverage.info
+        lcov --remove coverage.info '/usr/*' --output-file coverage.info
+        bash <(curl -s https://codecov.io/bash)
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Dependencies
+      run: brew install cmake ninja
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+          -DBUILD_TESTING=ON
+    
+    - name: Build
+      run: cmake --build build --parallel
+    
+    - name: Run Tests
+      run: cd build && ctest --output-on-failure
+    
+    - name: Build iOS Framework
+      run: |
+        xcodebuild -project Platform/iOS/GenesisSensor.xcodeproj \
+          -scheme GenesisSensor \
+          -configuration Release \
+          -sdk iphoneos \
+          CODE_SIGNING_ALLOWED=NO
+
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build -G "Visual Studio 17 2022" -A x64 `
+          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
+          -DBUILD_TESTING=ON
+    
+    - name: Build
+      run: cmake --build build --config ${{env.BUILD_TYPE}} --parallel
+    
+    - name: Run Tests
+      run: cd build ; ctest -C ${{env.BUILD_TYPE}} --output-on-failure
+
+  build-android:
+    name: Build (Android)
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+    
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+    
+    - name: Build Android AAR
+      run: |
+        cd Platform/Android
+        ./gradlew assembleRelease
+    
+    - name: Upload AAR
+      uses: actions/upload-artifact@v3
+      with:
+        name: genesis-android-aar
+        path: Platform/Android/build/outputs/aar/*.aar
+
+  docker-build:
+    name: Docker Build & Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build Docker Image
+      run: docker build -f Docker/Dockerfile -t genesis-sdk:${{github.sha}} .
+    
+    - name: Run Tests in Docker
+      run: docker run genesis-sdk:${{github.sha}}
+
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    needs: [build-linux]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build libbluetooth-dev
+    
+    - name: Build Benchmarks
+      run: |
+        cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=ON
+        cmake --build build --parallel
+    
+    - name: Run Benchmarks
+      run: ./build/benchmarks/genesis_benchmark --benchmark_format=json > benchmark_results.json
+    
+    - name: Upload Results
+      uses: actions/upload-artifact@v3
+      with:
+        name: benchmark-results
+        path: benchmark_results.json
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-macos, build-windows, build-android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
